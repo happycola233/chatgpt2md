@@ -1,250 +1,269 @@
 # ChatGPT聊天记录导出为Markdown
 
-将 ChatGPT 导出的 **对话 JSON** 转换为**清爽可读**的 Markdown 文档（.md）。  
-它会自动沿着对话树找到**当前分支（最终态）**，只导出“用户 ↔ 助手”的文本内容，并为每条消息加上**时间戳**与**身份标题**。
+将 **ChatGPT 导出 JSON** 转换为可读性极高的 **Markdown**：自动把同一轮推理中出现的 `thoughts` / `assistant code` / `reasoning_recap` 合并为一个可折叠的 `<details>` 区块，并将其插入到“下一条助手文本”的正文最前面；还支持 **数学公式美化** 与 **代码推理整段引用渲染**。
 
-> 本程序不借助浏览器插件，因此可以适用于大多数**镜像站**。
+> 适用于：复盘模型推理、归档对话、技术博客记录、审计与分享。
+
+---
+
+## 目录
+
+* [特性](#特性)
+* [安装与环境](#安装与环境)
+* [使用方法](#使用方法)
+
+  * [交互式（无命令行参数）](#交互式无命令行参数)
+  * [最简命令行](#最简命令行)
+  * [指定输入与输出路径](#指定输入与输出路径)
+  * [命令行帮助](#命令行帮助)
+  * [路径带空格/引号](#路径带空格引号)
+  * [拖拽打开（Windows）](#拖拽打开windows)
+* [输入文件来源](#输入文件来源)
+
+  * [如何获取 JSON 文件+操作步骤](#如何获取-json-文件操作步骤)
+* [输出示例](#输出示例)
+* [渲染与规则](#渲染与规则)
+
+  * [推理折叠块](#推理折叠块)
+  * [数学美化](#数学美化)
+  * [代码推理整段引用](#代码推理整段引用)
+* [错误与排错](#错误与排错)
+* [已知限制](#已知限制)
+* [开发说明](#开发说明)
+* [Roadmap](#roadmap)
+* [协议与免责声明](#协议与免责声明)
+* [致谢](#致谢)
+
+---
+
+## 特性
+
+* ✅ **最终态分支**：仅沿 `current_node` 回溯到根，输出“从根到叶”的最终可见对话路径。
+* ✅ **推理合并**：将同一轮的
+
+  * `thoughts`（支持多段，含 `summary` 与 `content`）
+  * `assistant code`（自动配对紧随其后的 tool `execution_output`）
+  * `reasoning_recap`
+    合并为一个 `<details>` 折叠区块，**按时间升序**排列子项。
+* ✅ **代码推理整段引用**：标题、代码围栏、运行结果围栏全部置于引用（每行以 `>` 开头），阅读体验统一。
+* ✅ **数学美化**（跳过代码围栏，包含“引用内代码围栏”）：
+
+  * 行内 `\( ... \)` → `$ ... $`
+  * 显示 `\[` … `\]` → `$$` 块（列表项中整体缩进两格）
+* ✅ **推理块与正文之间自动空一行**，版式更稳。
+* ✅ **纯标准库**，零依赖。
+* ✅ **CLI + 交互式输入**：既可 `chatgpt2md input.json`，也可直接运行后手动输入路径。
+* ✅ **路径容错**：自动处理带空格与带引号的路径，支持 `~` 与环境变量展开。
+
+---
+
+## 安装与环境
+
+* Python **3.8+**（建议 3.10+）
+* 无三方依赖，clone 本仓库即可使用：
 
 
 ---
 
-## 功能特点
+## 使用方法
 
-- ✅ **只导出最终分支**：从 `current_node` 沿父链回溯到根，避免历史分叉带来的重复与噪音。
-    
-- ✅ **角色清晰**：每条消息前自动加上 `# 用户` / `# ChatGPT` 标题。
-    
-- ✅ **带时间戳**：按本地时区将 `create_time`（Unix 时间戳）格式化为 `YYYY-MM-DD HH:MM:SS`。
-    
-- ✅ **内容过滤**：仅保留 `role ∈ {user, assistant}` 且 `content_type ∈ {text, multimodal_text}` 的文本消息。
-    
-- ✅ **零依赖**：仅使用 Python 标准库（`sys`, `os`, `json`, `datetime`）。
-    
-
----
-
-## 适用场景
-
-- 把某次 ChatGPT 会话整理成笔记、纪要、复盘或 PRD 附件。
-    
-- 将长对话拆分为章节并加入个人知识库。
-    
-- 导出问答对，便于搜索、标注和分享。
-    
-
----
-
-## 工作原理
-
-1. 读取 JSON，定位 `mapping`（对话节点哈希表）与 `current_node`（当前叶子）。
-    
-2. 沿 `current_node → parent → parent ...` 回溯到根，得到**当前分支**的节点列表（随后反转为“从根到叶”的自然阅读顺序）。
-    
-3. 逐节点筛选：
-    
-    - 仅保留 `author.role` 为 `user` 或 `assistant`；
-        
-    - 仅保留 `content.content_type` 为 `text` 或 `multimodal_text`；
-        
-    - 合并 `content.parts` 中的**字符串项**为正文。
-        
-4. 生成 Markdown：
-    
-    ```
-    # 用户｜# ChatGPT
-    > 时间：YYYY-MM-DD HH:MM:SS
-    正文...
-    ```
-    
-5. 将结果写入 **同名 .md 文件**（与源 JSON 同目录）。
-    
-
-
----
-
-## 快速开始
+### 交互式（无命令行参数）
 
 ```bash
-# 基本用法
-python chatgpt2md.py <path/to/conversation.json>
-
-# 运行成功后，会在同目录生成同名 Markdown：
-# <path/to/conversation.md>
-```
-****
-Windows PowerShell 示例：
-
-```powershell
-python .\chatgpt2md.py .\export\my_conversation.json
+python chatgpt2md.py
 ```
 
-macOS / Linux 示例：
+程序会提示你输入 ChatGPT 导出 JSON 的路径（可带引号）。输出会写到**同目录**、**同名**的 `.md` 文件。
+
+### 最简命令行
 
 ```bash
-python3 ./chatgpt2md.py ./export/my_conversation.json
+python chatgpt2md.py path/to/conversation.json
+# 输出：path/to/conversation.md
 ```
+
+> 提示：输入文件扩展名不必一定是 `.json`，**只要文件内容是 JSON**，`.txt` 也可。
+
+### 指定输入与输出路径
+
+* 位置参数：
+
+```bash
+python chatgpt2md.py path/to/input.json path/to/output.md
+```
+
+* 或使用选项：
+
+```bash
+python chatgpt2md.py -i path/to/input.json -o path/to/output.md
+```
+
+### 命令行帮助
+
+```bash
+python chatgpt2md.py -h
+```
+
+会展示所有参数与示例。
+
+### 路径带空格/引号
+
+以下写法均可（Windows / macOS / Linux）：
+
+```bash
+python chatgpt2md.py "C:\path with space\input.json"
+python chatgpt2md.py -i "~/Downloads/input.txt" -o "%USERPROFILE%/Desktop/output.md"
+```
+
+程序会自动去掉首尾引号，并展开 `~` 与环境变量。
+
+### 拖拽打开（Windows）
+
+你也可以把包含 JSON 的 `TXT` 文件**拖动到本程序**（`chatgpt2md.py`）图标上打开。程序会把该拖入的文件路径作为输入，并在同目录下生成 `.md`。
 
 ---
 
-## 如何获取 JSON 文件+操作步骤
+## 输入文件来源
 
-1. 在 GPT 对话聊天界面，鼠标右键，点击” **检查** “或” **开发人员选项** ”，或直接按 **F12**
-![Screenshot](res/1.png)
-2. 在弹出的窗口（后续简称 **开发者窗口**）中，选择“ **网络** ”选择卡
-![Screenshot](res/2.png)
-3. 复制聊天中自己发送或GPT回复的一小段内容（便于后续搜索）
-![Screenshot](res/3.png)
-4. 刷新网页（Ctrl+R），请注意，刷新时，**之前打开的开发者窗口不能关闭**
+建议直接从 ChatGPT 网页端抓取 **包含完整对话树的 JSON**（见下文步骤），或使用其他导出工具得到等价结构（需包含 `mapping`、`current_node`、`message` 等字段）。
+
+### 如何获取 JSON 文件+操作步骤
+
+1. 在 GPT 对话聊天界面，鼠标右键，点击” **检查** “或” **开发人员选项** ”，或直接按 **F12**。
+   ![Screenshot](res/1.png)
+2. 在弹出的窗口（后续简称 **开发者窗口**）中，选择“ **网络** ”选择卡。
+   ![Screenshot](res/2.png)
+3. 复制聊天中自己发送或GPT回复的一小段内容（便于后续搜索）。
+   ![Screenshot](res/3.png)
+4. 刷新网页（Ctrl+R），请注意，刷新时，**之前打开的开发者窗口不能关闭**。
 5. 此时，开发者窗口中应该出现了很多网络请求。点击一下开发者窗口的空白区域（或随便点一个网络请求），确保窗口焦点在开发者窗口上。
-6. 按 ”Ctrl+F“，粘贴刚刚复制的消息，然后Enter进行搜索，点击搜索出来的结果（如果出现了多个结果，请自行辨别哪个是与自己聊天记录相关的内容。
-![Screenshot](res/4.png)
-7. 如图所示，在Json区域，按 **Ctrl+A** 全选内容，复制
-![Screenshot](res/5.png)
+6. 按 “Ctrl+F”，粘贴刚刚复制的消息，然后Enter进行搜索，点击搜索出来的结果（如果出现了多个结果，请自行辨别哪个是与自己聊天记录相关的内容。
+   ![Screenshot](res/4.png)
+7. 如图所示，在Json区域，按 **Ctrl+A** 全选内容，复制。
+   ![Screenshot](res/5.png)
 8. 在本地新建一个文本文档（TXT），然后粘贴刚刚复制的内容，保存。（**建议不要用默认名称“新建 文本文档.txt”， 防止后续程序覆盖了您的重要文件！！！**）
-9. 把该 TXT 拖动到本程序上打开，或使用命令行 `chatgpt2md <path/to/conversation.json>`（文件扩展名无需改成 json，txt 也可以）
-![Screenshot](res/6.png)
+9. 把该 TXT 拖动到本程序上打开，或使用命令行 `chatgpt2md.exe <path/to/conversation.json>`（文件扩展名无需改成 json，txt 也可以）
+   ![Screenshot](res/6.png)
 10. 此时应该可以看到，在TXT同目录下，创建一个与该TXT同名的Markdown文件。（**请注意，如果您原本有同名的重要.md文件，请备份，本程序生成操作会覆盖！！！**）
 
 ---
 
-## 输入 JSON 格式说明
+## 输出示例
 
-本脚本假设 JSON 大致符合下述结构（**关键字段**）：
+推理（thoughts + 代码 + 运行结果 + recap）会被折叠到一个 `<details>` 中，并插入到其后的 **第一条助手文本** 的正文前方；推理块与正文之间**空一行**。
 
-```json
-{
-  "mapping": {
-    "id_root": {
-      "id": "id_root",
-      "message": {
-        "author": {"role": "user"},
-        "content": {
-          "content_type": "text",
-          "parts": ["你好，帮我做个总结。"]
-        },
-        "create_time": 1724450000.0
-      },
-      "parent": null
-    },
-    "id_leaf": {
-      "id": "id_leaf",
-      "message": {
-        "author": {"role": "assistant"},
-        "content": {
-          "content_type": "multimodal_text",
-          "parts": ["当然可以，这是总结..."]
-        },
-        "create_time": 1724450010.0
-      },
-      "parent": "id_root"
-    }
-  },
-  "current_node": "id_leaf"
-}
-```
-
-- **`mapping`**：对话节点表，键为节点 ID。
-    
-- **`current_node`**：指向当前对话的“叶子节点”（即你最后一次看到的版本）。
-    
-- **`message.author.role`**：消息角色（`user` / `assistant` / `system` / `tool` ...）。
-    
-- **`message.content.content_type`**：脚本仅处理 `text` 和 `multimodal_text`。
-    
-- **`message.content.parts`**：消息文本片段数组；**只有字符串会被合并**输出。
-    
-- **`message.create_time`**：Unix 时间戳（秒），可为字符串或浮点数。
-    
-
-> 如果你的 JSON 略有差异（比如字段名不同），需要先适配或在脚本中增加兼容逻辑。
-
----
-
-## 输出 Markdown 结构
-
-典型输出（节选）：
-
-```markdown
-# 用户
-> 时间：2025-08-24 14:35:02
-你好，帮我做个总结。
-
+````markdown
 # ChatGPT
-> 时间：2025-08-24 14:35:10
-当然可以，这是总结...
-```
+> 时间：2025-08-27 12:34:56
 
-- 标题仅用一级 `#`，便于快速定位角色。
-    
-- 时间为**本地时区**（使用 `datetime.fromtimestamp`）。
-    
+<details>
+<summary>已思考 49s</summary>
 
----
+> **解释电池容量转换和充电效率**
+> ```python
+> energy_wh = 72.0
+> usb_wh = 11.52 * 5.0
+> ...
+> ```
+> ```
+> (57.6, 0.8, 23.22, 0.72, 0.576, 0.5184, 2.232558...)
+> ```
 
+> **数学示例**
+> > 行内数学会被美化如 \(E=mc^2\) → $E=mc^2$
+> > 显示数学 \[ a^2 + b^2 = c^2 \] → $$ 块
+</details>
 
-## 常见问题（FAQ）
-
-**Q1：为什么有些消息没被导出？**  
-A：脚本只导出 `role ∈ {user, assistant}` 且 `content_type ∈ {text, multimodal_text}` 的消息，并且仅合并 `parts` 中的**字符串**。图片、文件、代码对象等非字符串内容会被忽略。
-
-**Q2：时间显示不对/时差有偏移？**  
-A：脚本使用本地时区来格式化时间戳。若希望固定为 UTC 或指定时区，可在脚本中扩展 `format_time`（见下文“路线图”）。
-
-**Q3：为什么导出的顺序是从最早到最新？**  
-A：脚本从 `current_node` 回溯到根节点后再反转，因此输出为“**从根到叶**”，符合阅读顺序。
-
-**Q4：我的 JSON 没有 `mapping` 或 `current_node` 怎么办？**  
-A：当前版本依赖这两个字段。你可以：
-
-- 检查导出的文件是否正确；
-    
-- 或依据你的 JSON 结构，修改 `parse_chat_to_markdown` 中的取值逻辑。
-    
-
-**Q5：支持图片或代码块吗？**  
-A：默认不支持（非字符串会被跳过）。可以在 `parts` 解析处根据对象结构插入占位或 Markdown 片段（见“路线图”）。
+正文从这里开始……
+````
 
 ---
 
-## 故障排查
+## 渲染与规则
 
-- **`错误：文件 xxx 不存在`**  
-    路径检查失败。请确认路径、文件名与扩展名（.json），以及是否有读权限。
-    
-- **`用法：python chatgpt2md.py <json_file>`**  
-    未提供参数。请传入 JSON 文件路径。
-    
-- **`JSON 解码失败`（如出现 `json.decoder.JSONDecodeError`）**  
-    文件不是合法 JSON，或包含 BOM/被截断。请用编辑器校验或重新导出。
-    
-- **脚本无反应/生成空文件**  
-    可能是 JSON 结构不匹配导致所有节点被过滤。建议打印或检查 `mapping` 中节点结构，核对 `role`、`content_type` 与 `parts` 的实际内容。
-    
+### 推理折叠块
 
----
+* 子项按 **(时间, 进入序)** 升序：
 
-## 兼容性说明
+  * `thought`：输出
 
-- **操作系统**：Windows / macOS / Linux
-    
-- **Python 版本**：3.8+（仅用标准库）
-    
-- **输入文件**：含 `mapping` 与 `current_node` 的 ChatGPT 会话 JSON 或兼容结构
-    
+    * `> **summary**`
+    * `content` 逐行引用，并进行**数学美化**（跳过代码围栏）
+  * `code`：输出
 
----
+    * `> **标题**`（若无则使用“代码推理”）
+    * 代码围栏与运行结果围栏统一放在**同一个引用块**中
+* 若遍历结束仍有未输出的会话，将其作为**单独一条助手消息**输出（仅 `<details>`）。
 
-## 安全与隐私
+### 数学美化
 
-- 脚本在**本地**处理文件，不会联网。
-    
-- 请确保 JSON 中不含敏感信息；导出与分享 Markdown 前建议进行脱敏处理。
-    
-- 对于包含第三方或受保护内容的对话，遵守相应的版权与合规要求。
-    
+* 行内：`\( ... \)` → `$ ... $`
+* 显示：独立行 `\[` … `\]` → `$$` 块，并在列表项中整体**缩进两格**，前后各空一行。
+* **跳过代码围栏**（包括 **引用内的代码围栏** 形如 `> ```python`），避免误替换。
+* 不反转义 `\~` 与 `\@`。
+
+### 代码推理整段引用
+
+* `_render_code_run()` 生成的代码推理段，**整段**走 `_to_blockquote()`，保证标题、代码围栏、运行结果围栏行行都有 `>`。
+* `beautify_markdown()` 使用 `_FENCE_RE` 识别 `> ```...` 这种**引用内围栏**，从而在美化阶段跳过代码内容。
 
 ---
 
-## 许可证
+## 错误与排错
 
-本项目采用 **MIT License**。
+* **JSON 解析失败**：确认复制的内容完整（`mapping`、`current_node` 存在），文件编码为 UTF-8。
+* **输出覆盖**：程序会**直接覆盖**目标 `.md`，请预先备份同名文件。
+* **VSCode / Pylance 类型提示**：已使用 `from __future__ import annotations` 与 `tuple[Optional[str], Optional[str]]`，避免 `reportInvalidTypeForm`。
+* **SyntaxWarning（无效转义）**：源码 docstring 使用原始字符串 `r"""..."""`，避免 `\(`/`\[` 告警。
+
+---
+
+## 已知限制
+
+* 仅处理 **最终态分支**（由 `current_node` 回溯构建），不会遍历所有分叉版本。
+* 仅渲染 `content.content_type in {"text","multimodal_text"}` 的 **用户/助手消息**；其他类型（例如文件、图片二进制）不会直接输出。
+* `tool` 输出仅自动配对 **python 执行结果**（`author.name == "python"` 且 `execution_output`）。
+* 针对 Markdown 渲染差异，不同平台/预览器可能存在细微表现差别。
+
+---
+
+## 开发说明
+
+* 代码为 **纯标准库** 实现，无外部依赖。
+* 核心模块：
+
+  * `beautify_markdown()`：数学美化（避开代码围栏/引用内围栏）。
+  * `ReasoningSession`：聚合 thoughts/code/reasoning\_recap；在遇到助手文本时“落盘”到 `<details>`。
+  * CLI/交互：支持 **位置参数**、**-i/-o 选项**、**交互式输入**、**路径去引号与展开**。
+* 风格：
+
+  * 尽量纯函数化与小粒度方法；注释详尽，避免“屎山”。
+
+---
+
+## Roadmap
+
+* [ ] 可选输出：**完整分叉树**（不仅最终态）
+* [ ] 可选模板：如“把 `<details>` 放在消息末尾”
+* [ ] 导出时的图片/文件 URL 处理与占位
+* [ ] 可配置的数学美化开关与样式
+
+---
+
+## 协议与免责声明
+
+* 本工具用于**个人备份与阅读优化**。请遵守相关平台的服务条款与隐私政策，不要公开分享含有敏感信息的导出内容。
+* 代码与文档以 **MIT License** 发布。
+
+---
+
+## 致谢
+
+* 灵感来源于大家对“可读的推理记录”的共同诉求。
+* 感谢所有反馈者的建议与测试。
+
+---
+
+### Star & Issue
+
+如果本工具对你有帮助，请点个 ⭐️。有问题或建议，欢迎提 Issue！
