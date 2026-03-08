@@ -90,6 +90,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 
 # ==============================================================================
@@ -100,6 +101,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # ==============================================================================
 BLANK = "  "                          # 单个“空行占位”
 TRIPLE_BLANK = [BLANK, BLANK, BLANK]  # 三行空行占位
+_CITE_TOKEN_RE = re.compile(r"cite.*?")
 
 
 # ==============================================================================
@@ -136,6 +138,176 @@ def _extend_block(lines: List[str], block: str) -> None:
         return
     for ln in str(block).splitlines():
         lines.append(ln)
+
+
+# ==============================================================================
+# 2.5) 引用标记（cite...）转标准 Markdown 引用
+# ------------------------------------------------------------------------------
+# 目标：
+# - 将正文里的内部引用标记替换为：([Attribution][n])
+# - 在文末生成：[n]: URL "Title"
+# ==============================================================================
+@dataclass
+class _CitationEntry:
+    index: int
+    url: str
+    title: str = ""
+    attribution: str = ""
+
+
+class CitationRegistry:
+    """
+    维护“URL -> 引用编号”的稳定映射，支持去重与文末引用定义渲染。
+    """
+    def __init__(self, start_index: int = 1) -> None:
+        self._entries: List[_CitationEntry] = []
+        self._url_to_pos: Dict[str, int] = {}
+        self._start_index = max(1, int(start_index))
+
+    def add(self, *, url: str, title: str = "", attribution: str = "") -> Optional[int]:
+        url = str(url or "").strip()
+        if not url:
+            return None
+
+        if url in self._url_to_pos:
+            pos = self._url_to_pos[url]
+            ent = self._entries[pos]
+            if not ent.title and title:
+                ent.title = str(title).strip()
+            if not ent.attribution and attribution:
+                ent.attribution = str(attribution).strip()
+            return ent.index
+
+        idx = self._start_index + len(self._entries)
+        self._url_to_pos[url] = len(self._entries)
+        self._entries.append(_CitationEntry(
+            index=idx,
+            url=url,
+            title=str(title or "").strip(),
+            attribution=str(attribution or "").strip(),
+        ))
+        return idx
+
+    def render_footnotes(self) -> List[str]:
+        lines: List[str] = []
+        for ent in self._entries:
+            if ent.title:
+                title = ent.title.replace('"', r'\"')
+                lines.append(f'[{ent.index}]: {ent.url} "{title}"')
+            else:
+                lines.append(f"[{ent.index}]: {ent.url}")
+        return lines
+
+    def count(self) -> int:
+        return len(self._entries)
+
+
+def _domain_fallback_label(url: str) -> str:
+    host = (urlparse(url or "").netloc or "").strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host or "Source"
+
+
+def _extract_primary_source_from_ref(ref: Dict[str, Any]) -> Tuple[str, str, str]:
+    """
+    从 content_references 单条记录里提取“主来源”：
+    返回 (url, title, attribution)；取不到则返回空字符串。
+    """
+    items = ref.get("items")
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip()
+            if not url:
+                continue
+            title = str(item.get("title") or "").strip()
+            attribution = str(item.get("attribution") or "").strip()
+            return url, title, attribution
+
+    safe_urls = ref.get("safe_urls")
+    if isinstance(safe_urls, list):
+        for u in safe_urls:
+            if isinstance(u, str) and u.strip():
+                return u.strip(), "", ""
+
+    alt = str(ref.get("alt") or "").strip()
+    # 兼容 alt 形如：([OpenAI开发者平台](https://...))
+    m = re.search(r"\(\[([^\]]+)\]\((https?://[^)]+)\)\)", alt)
+    if m:
+        return m.group(2).strip(), "", m.group(1).strip()
+
+    return "", "", ""
+
+
+def _register_sources_footnote(ref: Dict[str, Any], registry: CitationRegistry) -> None:
+    """
+    处理 type == sources_footnote，把 sources 列表注册到文末引用池。
+    """
+    sources = ref.get("sources")
+    if not isinstance(sources, list):
+        return
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        registry.add(
+            url=str(src.get("url") or "").strip(),
+            title=str(src.get("title") or "").strip(),
+            attribution=str(src.get("attribution") or "").strip(),
+        )
+
+
+def _replace_internal_cites_with_markdown_refs(
+    raw_text: str,
+    msg: Dict[str, Any],
+    registry: CitationRegistry,
+) -> str:
+    """
+    把消息正文中的内部 cite 标记替换为标准 Markdown 引用格式：
+    - cite... -> ([Attribution][n])
+    """
+    if not raw_text:
+        return raw_text
+
+    meta = msg.get("metadata", {}) or {}
+    refs = meta.get("content_references", []) or []
+    if not isinstance(refs, list):
+        return _CITE_TOKEN_RE.sub("", raw_text)
+
+    text = raw_text
+    replacements: List[Tuple[int, str, str]] = []
+
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+
+        if ref.get("type") == "sources_footnote":
+            _register_sources_footnote(ref, registry)
+            continue
+
+        matched_text = str(ref.get("matched_text") or "")
+        if not matched_text or not matched_text.strip():
+            continue
+
+        url, title, attribution = _extract_primary_source_from_ref(ref)
+        idx = registry.add(url=url, title=title, attribution=attribution) if url else None
+        if not idx:
+            continue
+
+        label = attribution or _domain_fallback_label(url)
+        replacement = f"([{label}][{idx}])"
+        start_idx = ref.get("start_idx")
+        sort_key = start_idx if isinstance(start_idx, int) else sys.maxsize
+        replacements.append((sort_key, matched_text, replacement))
+
+    replacements.sort(key=lambda x: x[0])
+    for _, matched_text, replacement in replacements:
+        text = text.replace(matched_text, replacement, 1)
+
+    # 清理没匹配成功的内部引用标记，避免脏字符残留到 Markdown
+    text = _CITE_TOKEN_RE.sub("", text)
+    return text
 
 
 # ==============================================================================
@@ -648,6 +820,7 @@ def parse_chat_to_markdown(json_file_path: str) -> str:
     # 2) 遍历分支并输出
     out_lines: List[str] = []
     session = ReasoningSession()
+    next_citation_index = 1
 
     for node_id in branch_ids:
         node = mapping.get(node_id) or {}
@@ -729,6 +902,10 @@ def parse_chat_to_markdown(json_file_path: str) -> str:
         # -------------------
         model_slug = _get_model_slug_for_message(msg, conversation_default_model)
         time_str = format_time(create_time)
+        msg_citation_registry = CitationRegistry(start_index=next_citation_index)
+        raw_text = _replace_internal_cites_with_markdown_refs(raw_text, msg, msg_citation_registry).strip()
+        if not raw_text:
+            continue
 
         # AI 正文（做数学美化）
         ai_text = beautify_markdown(raw_text)
@@ -750,6 +927,14 @@ def parse_chat_to_markdown(json_file_path: str) -> str:
 
         # 正文
         _extend_block(out_lines, ai_text)
+
+        # 引用定义（仅该条 AI 响应）
+        ai_footnotes = msg_citation_registry.render_footnotes()
+        if ai_footnotes:
+            out_lines.append("")
+            out_lines.extend(ai_footnotes)
+
+        next_citation_index += msg_citation_registry.count()
 
         # 结束空三行
         out_lines.extend(TRIPLE_BLANK)
