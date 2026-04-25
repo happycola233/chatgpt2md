@@ -101,7 +101,7 @@ from urllib.parse import urlparse
 # ==============================================================================
 BLANK = "  "                          # 单个“空行占位”
 TRIPLE_BLANK = [BLANK, BLANK, BLANK]  # 三行空行占位
-_CITE_TOKEN_RE = re.compile(r"cite.*?")
+_INTERNAL_CITATION_TOKEN_RE = re.compile(r"(?:cite|filecite).*?")
 
 
 # ==============================================================================
@@ -150,27 +150,27 @@ def _extend_block(lines: List[str], block: str) -> None:
 @dataclass
 class _CitationEntry:
     index: int
-    url: str
+    target: str
     title: str = ""
     attribution: str = ""
 
 
 class CitationRegistry:
     """
-    维护“URL -> 引用编号”的稳定映射，支持去重与文末引用定义渲染。
+    维护“Markdown link target -> 引用编号”的稳定映射，支持去重与文末引用定义渲染。
     """
     def __init__(self, start_index: int = 1) -> None:
         self._entries: List[_CitationEntry] = []
-        self._url_to_pos: Dict[str, int] = {}
+        self._target_to_pos: Dict[str, int] = {}
         self._start_index = max(1, int(start_index))
 
-    def add(self, *, url: str, title: str = "", attribution: str = "") -> Optional[int]:
-        url = str(url or "").strip()
-        if not url:
+    def add(self, *, target: str = "", url: str = "", title: str = "", attribution: str = "") -> Optional[int]:
+        target = str(target or url or "").strip()
+        if not target:
             return None
 
-        if url in self._url_to_pos:
-            pos = self._url_to_pos[url]
+        if target in self._target_to_pos:
+            pos = self._target_to_pos[target]
             ent = self._entries[pos]
             if not ent.title and title:
                 ent.title = str(title).strip()
@@ -179,10 +179,10 @@ class CitationRegistry:
             return ent.index
 
         idx = self._start_index + len(self._entries)
-        self._url_to_pos[url] = len(self._entries)
+        self._target_to_pos[target] = len(self._entries)
         self._entries.append(_CitationEntry(
             index=idx,
-            url=url,
+            target=target,
             title=str(title or "").strip(),
             attribution=str(attribution or "").strip(),
         ))
@@ -191,15 +191,34 @@ class CitationRegistry:
     def render_footnotes(self) -> List[str]:
         lines: List[str] = []
         for ent in self._entries:
+            target = _format_markdown_link_target(ent.target)
             if ent.title:
                 title = ent.title.replace('"', r'\"')
-                lines.append(f'[{ent.index}]: {ent.url} "{title}"')
+                lines.append(f'[{ent.index}]: {target} "{title}"')
             else:
-                lines.append(f"[{ent.index}]: {ent.url}")
+                lines.append(f"[{ent.index}]: {target}")
         return lines
 
     def count(self) -> int:
         return len(self._entries)
+
+
+def _format_markdown_link_target(target: str) -> str:
+    """
+    Markdown 引用定义里的目标地址。
+    普通 URL 原样输出；带空格/括号等字符时用 <...> 包起来，避免文件名类目标破坏语法。
+    """
+    target = str(target or "").strip()
+    if not target:
+        return target
+    if any(ch.isspace() for ch in target) or any(ch in target for ch in '<>()"'):
+        return f"<{target.replace('>', r'\>')}>"
+    return target
+
+
+def _format_markdown_link_label(label: str) -> str:
+    """转义引用标签里的方括号，避免文件名/来源名破坏 Markdown 链接语法。"""
+    return str(label or "Source").replace("\\", "\\\\").replace("[", r"\[").replace("]", r"\]")
 
 
 def _domain_fallback_label(url: str) -> str:
@@ -241,6 +260,32 @@ def _extract_primary_source_from_ref(ref: Dict[str, Any]) -> Tuple[str, str, str
     return "", "", ""
 
 
+def _extract_file_source_from_ref(ref: Dict[str, Any]) -> Tuple[str, str, str]:
+    """
+    从 content_references 的 type == "file" 记录里提取 Markdown 引用信息：
+    返回 (target, title, label)。
+
+    ChatGPT 的文件引用常常没有公开 URL，因此用优先级：
+    - cloud_doc_url：若存在，直接作为可点击目标
+    - sediment://file_xxx：保留稳定内部文件 id，便于后续二次处理
+    - 文件名：最后兜底，仍能形成合法 Markdown 引用定义
+    """
+    name = str(ref.get("name") or "").strip()
+    file_id = str(ref.get("id") or "").strip()
+    cloud_doc_url = str(ref.get("cloud_doc_url") or "").strip()
+
+    if cloud_doc_url:
+        target = cloud_doc_url
+    elif file_id:
+        target = f"sediment://{file_id}"
+    else:
+        target = name
+
+    label = name or file_id or "File"
+    title = name
+    return target, title, label
+
+
 def _register_sources_footnote(ref: Dict[str, Any], registry: CitationRegistry) -> None:
     """
     处理 type == sources_footnote，把 sources 列表注册到文末引用池。
@@ -266,6 +311,7 @@ def _replace_internal_cites_with_markdown_refs(
     """
     把消息正文中的内部 cite 标记替换为标准 Markdown 引用格式：
     - cite... -> ([Attribution][n])
+    - filecite... -> ([File name][n])
     """
     if not raw_text:
         return raw_text
@@ -273,7 +319,7 @@ def _replace_internal_cites_with_markdown_refs(
     meta = msg.get("metadata", {}) or {}
     refs = meta.get("content_references", []) or []
     if not isinstance(refs, list):
-        return _CITE_TOKEN_RE.sub("", raw_text)
+        return _INTERNAL_CITATION_TOKEN_RE.sub("", raw_text)
 
     text = raw_text
     replacements: List[Tuple[int, str, str]] = []
@@ -290,13 +336,19 @@ def _replace_internal_cites_with_markdown_refs(
         if not matched_text or not matched_text.strip():
             continue
 
-        url, title, attribution = _extract_primary_source_from_ref(ref)
-        idx = registry.add(url=url, title=title, attribution=attribution) if url else None
+        ref_type = ref.get("type")
+        if ref_type == "file":
+            target, title, label = _extract_file_source_from_ref(ref)
+            idx = registry.add(target=target, title=title, attribution=label) if target else None
+        else:
+            target, title, attribution = _extract_primary_source_from_ref(ref)
+            idx = registry.add(target=target, title=title, attribution=attribution) if target else None
+            label = attribution or _domain_fallback_label(target)
+
         if not idx:
             continue
 
-        label = attribution or _domain_fallback_label(url)
-        replacement = f"([{label}][{idx}])"
+        replacement = f"([{_format_markdown_link_label(label)}][{idx}])"
         start_idx = ref.get("start_idx")
         sort_key = start_idx if isinstance(start_idx, int) else sys.maxsize
         replacements.append((sort_key, matched_text, replacement))
@@ -306,7 +358,7 @@ def _replace_internal_cites_with_markdown_refs(
         text = text.replace(matched_text, replacement, 1)
 
     # 清理没匹配成功的内部引用标记，避免脏字符残留到 Markdown
-    text = _CITE_TOKEN_RE.sub("", text)
+    text = _INTERNAL_CITATION_TOKEN_RE.sub("", text)
     return text
 
 
