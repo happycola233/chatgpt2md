@@ -76,7 +76,16 @@ AI 正文（最终回复）
 3) 指定输出：
    python chatgpt2md.py input.json output.md
 
-4) 选项：
+4) 批量转换文件夹：
+   python chatgpt2md.py input_dir
+
+5) 批量转换文件夹并输出到另一个文件夹：
+   python chatgpt2md.py input_dir output_dir
+
+6) 递归批量转换：
+   python chatgpt2md.py input_dir output_dir -r
+
+7) 选项：
    python chatgpt2md.py -i input.json -o output.md
 """
 
@@ -1007,6 +1016,9 @@ def parse_chat_to_markdown(json_file_path: str) -> str:
 # ==============================================================================
 # 9) CLI / 交互式输入与文件写入
 # ==============================================================================
+BATCH_INPUT_EXTENSIONS = {".json", ".txt"}
+
+
 def _default_output_path_for(input_path: str) -> str:
     """输入 input.json -> 输出同目录同名 input.md"""
     base, _ = os.path.splitext(input_path)
@@ -1025,6 +1037,11 @@ def _readable_file(path: str) -> bool:
     return os.path.isfile(path) and os.access(path, os.R_OK)
 
 
+def _readable_dir(path: str) -> bool:
+    """输入目录是否存在且可读"""
+    return os.path.isdir(path) and os.access(path, os.R_OK)
+
+
 def _normalize_path_arg(p: Optional[str]) -> Optional[str]:
     """
     归一化路径参数：
@@ -1041,8 +1058,8 @@ def _normalize_path_arg(p: Optional[str]) -> Optional[str]:
 
 
 def _interactive_ask_input_path() -> Optional[str]:
-    """无参数时进入交互式，提示用户输入 JSON 路径"""
-    print("请输入需要处理的 ChatGPT 导出 JSON 文件路径（可带引号；输入 q 退出）：", end="", flush=True)
+    """无参数时进入交互式，提示用户输入 JSON 路径或目录"""
+    print("请输入需要处理的 ChatGPT 导出 JSON 文件路径或文件夹路径（可带引号；输入 q 退出）：", end="", flush=True)
     while True:
         user_in = input()
         if user_in is None:
@@ -1052,7 +1069,7 @@ def _interactive_ask_input_path() -> Optional[str]:
             return None
 
         candidate = _normalize_path_arg(user_in)
-        if candidate and _readable_file(candidate):
+        if candidate and (_readable_file(candidate) or _readable_dir(candidate)):
             return candidate
 
         print(f"路径无效或不可读：{user_in}\n请重新输入（或输入 q 退出）：", end="", flush=True)
@@ -1069,13 +1086,17 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
   1) 交互式：         python chatgpt2md.py
   2) 最简：           python chatgpt2md.py input.json
   3) 指定输出：       python chatgpt2md.py input.json output.md
-  4) 使用选项：       python chatgpt2md.py -i input.json -o output.md
+  4) 批量转换目录：   python chatgpt2md.py input_dir
+  5) 批量指定输出：   python chatgpt2md.py input_dir output_dir
+  6) 递归批量转换：   python chatgpt2md.py input_dir output_dir -r
+  7) 使用选项：       python chatgpt2md.py -i input.json -o output.md
         """.strip()
     )
 
     parser.add_argument("positional", nargs="*", help="可选的位置参数：input [output]")
-    parser.add_argument("-i", "--input", dest="input_path", help="输入 JSON 路径（可带引号）")
-    parser.add_argument("-o", "--output", dest="output_path", help="输出 Markdown 路径（可带引号）")
+    parser.add_argument("-i", "--input", dest="input_path", help="输入 JSON/TXT 文件或文件夹路径（可带引号）")
+    parser.add_argument("-o", "--output", dest="output_path", help="输出 Markdown 路径；目录输入时为输出文件夹（可带引号）")
+    parser.add_argument("-r", "--recursive", action="store_true", help="输入为文件夹时，递归转换子文件夹中的 .json/.txt 文件")
     return parser.parse_args(argv[1:])
 
 
@@ -1100,7 +1121,7 @@ def _resolve_io_paths(ns: argparse.Namespace) -> Tuple[Optional[str], Optional[s
     p_in = _normalize_path_arg(p_in) if p_in else None
     p_out = _normalize_path_arg(p_out) if p_out else None
 
-    if p_in and not p_out:
+    if p_in and not p_out and not _readable_dir(p_in):
         p_out = _default_output_path_for(p_in)
 
     return p_in, p_out
@@ -1109,6 +1130,58 @@ def _resolve_io_paths(ns: argparse.Namespace) -> Tuple[Optional[str], Optional[s
 def _ensure_output_path(output_path: Optional[str], input_path: str) -> str:
     """未提供输出路径则自动推导"""
     return output_path or _default_output_path_for(input_path)
+
+
+def _is_batch_candidate(path: str) -> bool:
+    """批量模式只尝试转换常见 ChatGPT 导出载体，避免误扫生成物或无关文件。"""
+    return _readable_file(path) and os.path.splitext(path)[1].lower() in BATCH_INPUT_EXTENSIONS
+
+
+def _is_path_within(path: str, directory: str) -> bool:
+    """判断 path 是否位于 directory 内部（含自身），兼容 Windows 不同盘符。"""
+    try:
+        path_abs = os.path.abspath(path)
+        dir_abs = os.path.abspath(directory)
+        return os.path.commonpath([path_abs, dir_abs]) == dir_abs
+    except ValueError:
+        return False
+
+
+def _iter_batch_inputs(input_dir: str, *, recursive: bool, exclude_dir: Optional[str] = None) -> List[str]:
+    """稳定排序地列出批量转换输入文件。"""
+    base_dir = os.path.abspath(input_dir)
+    excluded = os.path.abspath(exclude_dir) if exclude_dir else None
+    files: List[str] = []
+
+    if recursive:
+        for root, dirnames, filenames in os.walk(base_dir):
+            if excluded:
+                dirnames[:] = [
+                    d for d in dirnames
+                    if not _is_path_within(os.path.join(root, d), excluded)
+                ]
+            dirnames.sort()
+            for name in sorted(filenames):
+                path = os.path.join(root, name)
+                if _is_batch_candidate(path):
+                    files.append(path)
+    else:
+        for name in sorted(os.listdir(base_dir)):
+            path = os.path.join(base_dir, name)
+            if _is_batch_candidate(path):
+                files.append(path)
+
+    return files
+
+
+def _batch_output_path_for(input_file: str, input_dir: str, output_dir: Optional[str]) -> str:
+    """目录批量输出路径；指定输出目录时保留相对层级。"""
+    if not output_dir:
+        return _default_output_path_for(input_file)
+
+    rel = os.path.relpath(input_file, input_dir)
+    rel_base, _ = os.path.splitext(rel)
+    return os.path.join(output_dir, rel_base + ".md")
 
 
 def run_once(input_path: str, output_path: str) -> int:
@@ -1141,6 +1214,49 @@ def run_once(input_path: str, output_path: str) -> int:
     return 0
 
 
+def run_batch(input_dir: str, output_dir: Optional[str] = None, *, recursive: bool = False) -> int:
+    """
+    执行目录批量转换：
+    - 默认在每个输入文件旁生成同名 .md
+    - 指定 output_dir 时，把输出写入该目录并保留相对层级
+    - 继续处理后续文件，最后用返回码反映是否有失败
+    """
+    if not _readable_dir(input_dir):
+        print(f"错误：输入文件夹不存在或不可读：{input_dir}")
+        return 2
+
+    if output_dir and os.path.isfile(output_dir):
+        print(f"错误：目录批量转换时，输出路径必须是文件夹：{output_dir}")
+        return 5
+
+    abs_input_dir = os.path.abspath(input_dir)
+    abs_output_dir = os.path.abspath(output_dir) if output_dir else None
+    exclude_output_dir = (
+        abs_output_dir
+        if abs_output_dir and abs_output_dir != abs_input_dir and _is_path_within(abs_output_dir, abs_input_dir)
+        else None
+    )
+    files = _iter_batch_inputs(abs_input_dir, recursive=recursive, exclude_dir=exclude_output_dir)
+    if not files:
+        print(f"未找到可转换文件：{input_dir}（支持扩展名：{', '.join(sorted(BATCH_INPUT_EXTENSIONS))}）")
+        return 6
+
+    ok_count = 0
+    fail_count = 0
+    print(f"开始批量转换：{len(files)} 个文件")
+
+    for input_file in files:
+        output_file = _batch_output_path_for(input_file, abs_input_dir, abs_output_dir)
+        code = run_once(input_file, output_file)
+        if code == 0:
+            ok_count += 1
+        else:
+            fail_count += 1
+
+    print(f"批量转换完成：成功 {ok_count} 个，失败 {fail_count} 个")
+    return 0 if fail_count == 0 else 7
+
+
 def main() -> None:
     """
     程序入口：
@@ -1156,9 +1272,11 @@ def main() -> None:
             sys.exit(0)
         input_path = user_input_path
 
-    output_path = _ensure_output_path(output_path, input_path)
-
-    code = run_once(input_path, output_path)
+    if _readable_dir(input_path):
+        code = run_batch(input_path, output_path, recursive=bool(getattr(ns, "recursive", False)))
+    else:
+        output_path = _ensure_output_path(output_path, input_path)
+        code = run_once(input_path, output_path)
     sys.exit(code)
 
 

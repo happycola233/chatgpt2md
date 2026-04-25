@@ -22,6 +22,7 @@
 - ✅ **图片占位符**：遇到聊天里的图片（`multimodal_text` 的 `image_asset_pointer`），输出一个占位符与元信息注释，便于后处理替换为远程 URL 🖼️➡️🌐
 - ✅ **纯标准库**，零依赖 🐍
 - ✅ **CLI + 交互式输入**：既可 `chatgpt2md input.json`，也可直接运行后手动输入路径 💻
+- ✅ **批量转换文件夹**：输入目录即可批量转换 `.json` / `.txt`，支持递归与独立输出目录 📁
 - ✅ **路径容错**：自动处理带空格与带引号的路径，支持 `~` 与环境变量展开 🧭
 
 ---
@@ -70,6 +71,27 @@ python chatgpt2md.py path/to/input.json path/to/output.md
 
 ```bash
 python chatgpt2md.py -i path/to/input.json -o path/to/output.md
+```
+
+### 批量转换文件夹 📁
+
+输入路径是文件夹时，会批量转换该文件夹下的 `.json` / `.txt` 文件：
+
+```bash
+python chatgpt2md.py path/to/conversations
+```
+
+默认会在每个输入文件旁边生成同名 `.md`。如果指定输出文件夹，会把结果写入该目录：
+
+```bash
+python chatgpt2md.py path/to/conversations path/to/markdown-output
+python chatgpt2md.py -i path/to/conversations -o path/to/markdown-output
+```
+
+需要处理子文件夹时加 `-r` / `--recursive`，输出到独立文件夹时会保留相对目录结构：
+
+```bash
+python chatgpt2md.py path/to/conversations path/to/markdown-output -r
 ```
 
 ### 命令行帮助 🆘
